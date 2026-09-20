@@ -1,0 +1,61 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Model checkpoints and caches (downloaded at runtime)
+models/*
+!models/.gitkeep
+*.pt
+*.onnx
+*.engine
+*.ckpt
+
+# User media and generated artifacts
+data/input/*
+!data/input/.gitkeep
+data/samples/*
+!data/samples/.gitkeep
+outputs/*
+!outputs/events/
+outputs/events/*
+!outputs/events/.gitkeep
+!outputs/frames/
+outputs/frames/*
+!outputs/frames/.gitkeep
+!outputs/clips/
+outputs/clips/*
+!outputs/clips/.gitkeep
+!outputs/highlights/
+outputs/highlights/*
+!outputs/highlights/.gitkeep
+
+# Native build products and closed-source SDK payloads
+build/
+insta360/camera_bridge/build/
+insta360/camera_bridge/sdk/
+*.dylib
+*.so
+*.dll
+*.lib
+
+# Temporary runtime files
+*.tmp
+*.log
