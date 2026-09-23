@@ -104,8 +104,23 @@ def _storyboard_view(group: list[HighlightEvent]) -> ViewSpec | None:
                     pitch_deg=(min(pitches) + max(pitches)) / 2, fov_deg=fov)
 
 
+def _independent_replay(a: HighlightEvent, b: HighlightEvent) -> bool:
+    """时间组内只根据画面方向判断：同一个人移动到另一方向也可再剪入。"""
+    av, bv = a.view, b.view
+    if av.projection != "equirectangular" or bv.projection != "equirectangular":
+        return False
+    if not all(map(math.isfinite, (av.yaw_deg, av.pitch_deg, av.fov_deg,
+                                   bv.yaw_deg, bv.pitch_deg, bv.fov_deg))):
+        return False
+    yaw_gap = math.radians((av.yaw_deg - bv.yaw_deg + 180) % 360 - 180)
+    ap, bp = math.radians(av.pitch_deg), math.radians(bv.pitch_deg)
+    cosine = math.sin(ap) * math.sin(bp) + math.cos(ap) * math.cos(bp) * math.cos(yaw_gap)
+    separation = math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+    return separation >= max(90.0, (av.fov_deg + bv.fov_deg) / 2 + 10.0)
+
+
 def assemble_storyboard(events: list[HighlightEvent]) -> list[HighlightEvent]:
-    """同一源时间只播一次；重合动作合并时间轴并从全景中选一个覆盖视角。"""
+    """重合且方向相近的动作合并；方向明显不同的动作分别成镜头。"""
     ordered = sorted(events, key=lambda event: (event.start_sec, event.end_sec, event.candidate_id))
     if any(not all(map(math.isfinite, (event.start_sec, event.end_sec, event.best_sec)))
            or event.end_sec <= event.start_sec for event in ordered):
@@ -117,24 +132,40 @@ def assemble_storyboard(events: list[HighlightEvent]) -> list[HighlightEvent]:
         else:
             groups.append([event])
     storyboard = []
-    for group in groups:
-        best = max(group, key=_event_priority)
-        view = _storyboard_view(group)
-        if view is None:
-            merged = replace(best)
-            sources = [best]
-        else:
-            merged = replace(best, start_sec=min(item.start_sec for item in group),
-                             end_sec=max(item.end_sec for item in group), view=view,
-                             candidate_start_sec=min(item.candidate_start_sec for item in group),
-                             candidate_end_sec=max(item.candidate_end_sec for item in group),
-                             involved_track_ids=sorted({track for item in group
-                                                        for track in item.involved_track_ids}),
-                             person_ids=sorted({person for item in group for person in item.person_ids}))
-            sources = group
-        merged.event_id = len(storyboard)
-        merged.source_candidate_ids = sorted({item.candidate_id for item in sources})
-        storyboard.append(merged)
+    for group_index, group in enumerate(groups):
+        ranked = sorted(group, key=_event_priority, reverse=True)
+        anchors: list[HighlightEvent] = []
+        for item in ranked:
+            if not anchors or all(_independent_replay(item, anchor) for anchor in anchors):
+                anchors.append(item)
+        families: list[list[HighlightEvent]] = [[anchor] for anchor in anchors]
+        for item in ranked:
+            if any(item is anchor for anchor in anchors):
+                continue
+            for family in families:
+                if _storyboard_view(family + [item]) is not None:
+                    family.append(item)
+                    break
+        shots = []
+        for family in families:
+            best = family[0]
+            view = _storyboard_view(family)
+            assert view is not None
+            shots.append(replace(best, start_sec=min(item.start_sec for item in family),
+                                 end_sec=max(item.end_sec for item in family), view=view,
+                                 candidate_start_sec=min(item.candidate_start_sec for item in family),
+                                 candidate_end_sec=max(item.candidate_end_sec for item in family),
+                                 involved_track_ids=sorted({track for item in family
+                                                            for track in item.involved_track_ids}),
+                                 person_ids=sorted({person for item in family
+                                                    for person in item.person_ids}),
+                                 source_candidate_ids=sorted({item.candidate_id for item in family})))
+        if len(shots) > 1:
+            # 只重复各自实际获选的时间，避免强制扩大成整组的共同长窗口。
+            shots = [replace(shot, replay_group_id=group_index) for shot in shots]
+        for shot in shots:
+            shot.event_id = len(storyboard)
+            storyboard.append(shot)
     return storyboard
 
 

@@ -562,6 +562,32 @@ class PipelineTests(unittest.TestCase):
         with VideoReader(str(self.root / "event0_live.mp4"), "flat") as clip:
             self.assertEqual(clip.meta.frame_count, 31)
 
+    def test_distinct_directions_can_replay_same_source_time_in_reel(self):
+        self.video.unlink()
+        frame = np.zeros((128, 256, 3), dtype=np.uint8)
+        frame[:, :128, 2] = 220
+        frame[:, 128:, 0] = 220
+        with VideoWriter(str(self.video), 10, (256, 128)) as writer:
+            for _ in range(40):
+                writer.write(frame)
+        self.cfg.export.out_dir = str(self.root)
+        selected = assemble_storyboard([
+            event(candidate_id=0, view=ViewSpec("equirectangular", yaw_deg=0),
+                  involved_track_ids=[0], person_ids=[7], consensus_support=0.8),
+            event(candidate_id=1, view=ViewSpec("equirectangular", yaw_deg=180),
+                  involved_track_ids=[0], person_ids=[7], consensus_support=0.6),
+        ])
+        with VideoReader(str(self.video), "equirectangular") as reader:
+            export_live_photos(self.cfg.export, reader, selected)
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(selected[0].clip_start_sec, selected[1].clip_start_sec)
+        self.assertEqual(selected[0].clip_end_sec, selected[1].clip_end_sec)
+        for event_id in range(2):
+            with VideoReader(str(self.root / f"event{event_id}_live.mp4"), "flat") as clip:
+                self.assertEqual(clip.meta.frame_count, 30)
+        with VideoReader(str(self.root / "highlight_reel.mp4"), "flat") as reel:
+            self.assertEqual(reel.meta.frame_count, 60)
+
     def test_single_candidate_wrapper_writes_fractional_tail(self):
         candidate = CandidateRegion(12, .25, 2.3, ViewSpec("flat"), [0])
         path = self.root / "custom-name.mp4"
@@ -647,16 +673,72 @@ class TimelineTests(unittest.TestCase):
             gap = abs((chosen.view.yaw_deg - view.yaw_deg + 180) % 360 - 180)
             self.assertLess(gap, chosen.view.fov_deg / 2)
 
-    def test_opposite_360_views_keep_only_stronger_complete_action(self):
+    def test_opposite_360_views_replay_even_when_person_is_the_same(self):
         first = event(view=ViewSpec("equirectangular", yaw_deg=0),
-                      consensus_support=0.8)
+                      consensus_support=0.8, person_ids=[7])
         second = event(candidate_id=1, view=ViewSpec("equirectangular", yaw_deg=180),
-                       consensus_support=0.6)
+                       consensus_support=0.6, person_ids=[7])
         storyboard = assemble_storyboard([second, first])
-        self.assertEqual(len(storyboard), 1)
-        self.assertEqual((storyboard[0].start_sec, storyboard[0].end_sec), (1, 2))
-        self.assertEqual(storyboard[0].view.yaw_deg, 0)
-        self.assertEqual(storyboard[0].source_candidate_ids, [0])
+        self.assertEqual(len(storyboard), 2)
+        self.assertEqual([shot.view.yaw_deg for shot in storyboard], [0, 180])
+        self.assertEqual([shot.source_candidate_ids for shot in storyboard], [[0], [1]])
+        self.assertEqual([shot.replay_group_id for shot in storyboard], [0, 0])
+        self.assertTrue(all((shot.start_sec, shot.end_sec) == (1, 2) for shot in storyboard))
+
+    def test_three_separate_directions_each_get_a_shot(self):
+        shots = assemble_storyboard([
+            event(candidate_id=index, view=ViewSpec("equirectangular", yaw_deg=yaw,
+                                                    fov_deg=70), involved_track_ids=[0])
+            for index, yaw in enumerate((0, 120, -120))
+        ])
+        self.assertEqual(len(shots), 3)
+        self.assertEqual({shot.candidate_id for shot in shots}, {0, 1, 2})
+        self.assertEqual({shot.replay_group_id for shot in shots}, {0})
+
+    def test_moving_person_keeps_each_directions_own_action_interval(self):
+        shots = assemble_storyboard([
+            event(view=ViewSpec("equirectangular", yaw_deg=0),
+                  start_sec=1, end_sec=2, best_sec=1.5, person_ids=[7]),
+            event(candidate_id=1, view=ViewSpec("equirectangular", yaw_deg=180),
+                  start_sec=1.9, end_sec=3, best_sec=2.5, person_ids=[7]),
+        ])
+        self.assertEqual(len(shots), 2)
+        self.assertEqual({(shot.start_sec, shot.end_sec) for shot in shots},
+                         {(1, 2), (1.9, 3)})
+        self.assertEqual({shot.replay_group_id for shot in shots}, {0})
+
+    def test_similar_direction_never_replays_same_person(self):
+        shots = assemble_storyboard([
+            event(view=ViewSpec("equirectangular", yaw_deg=0), person_ids=[7]),
+            event(candidate_id=1, view=ViewSpec("equirectangular", yaw_deg=60),
+                  person_ids=[7]),
+        ])
+        self.assertEqual(len(shots), 1)
+        self.assertEqual(shots[0].source_candidate_ids, [0, 1])
+
+    def test_only_marked_replay_group_can_overlap_during_export(self):
+        first = event(view=ViewSpec("equirectangular", yaw_deg=0), replay_group_id=5)
+        second = event(event_id=1, candidate_id=1,
+                       view=ViewSpec("equirectangular", yaw_deg=180), replay_group_id=5)
+        plans = storyboard_clip_ranges([second, first], 3, 4)
+        self.assertEqual([item[0].event_id for item in plans], [0, 1])
+        self.assertEqual([item[1:] for item in plans], [(0, 3), (0, 3)])
+        second.replay_group_id = -1
+        with self.assertRaisesRegex(ValueError, "重叠"):
+            storyboard_clip_ranges([first, second], 3, 4)
+
+    def test_replay_group_context_is_trimmed_before_next_action(self):
+        first = event(view=ViewSpec("equirectangular", yaw_deg=0), replay_group_id=5)
+        second = event(event_id=1, candidate_id=1,
+                       view=ViewSpec("equirectangular", yaw_deg=180), replay_group_id=5)
+        later = event(event_id=2, candidate_id=2, start_sec=2.2, end_sec=3.2,
+                      best_sec=2.7)
+        plans = storyboard_clip_ranges([later, second, first], 3, 5)
+        self.assertEqual([item[0].event_id for item in plans], [0, 1, 2])
+        self.assertEqual(plans[0][2], plans[1][2])
+        self.assertEqual(plans[1][2], plans[2][1])
+        self.assertTrue(all(start <= event.start_sec and end >= event.end_sec
+                            for event, start, end in plans))
 
     def test_padding_respects_both_source_edges_and_short_source(self):
         near_end = event(start_sec=3.5, end_sec=3.8, best_sec=3.7)

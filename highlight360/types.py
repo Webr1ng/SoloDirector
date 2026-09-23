@@ -122,3 +122,4 @@ class HighlightEvent:
     jury_report_path: str = ""
     consensus_support: float = 0.0
     source_candidate_ids: list[int] = field(default_factory=list)
+    replay_group_id: int = -1

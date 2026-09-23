@@ -121,22 +121,34 @@ def clip_range(event: HighlightEvent, min_sec: float, source_duration: float) ->
 
 def storyboard_clip_ranges(events: list[HighlightEvent], min_sec: float,
                            source_duration: float) -> list[tuple[HighlightEvent, float, float]]:
-    """相邻动作可缩短补充背景，但不截掉模型选出的区间，也不回放源时间。"""
-    plans = [[event, *clip_range(event, min_sec, source_duration)]
-             for event in sorted(events, key=lambda item: (item.start_sec, item.event_id))]
-    for index in range(1, len(plans)):
-        previous, _, previous_end = plans[index - 1]
-        current, current_start, _ = plans[index]
-        if previous_end <= current_start + 1e-9:
-            continue
-        if previous.end_sec > current.start_sec + 1e-7:
+    """仅允许明确标记的不同方向镜头回放源时间；组与组之间只裁补足的上下文。"""
+    grouped: dict[tuple[str, int], list[list]] = {}
+    for index, event in enumerate(events):
+        key = (("replay", event.replay_group_id) if event.replay_group_id >= 0
+               else ("event", index))
+        grouped.setdefault(key, []).append([event, *clip_range(event, min_sec, source_duration)])
+    groups = sorted(grouped.values(), key=lambda plans: (
+        min(plan[0].start_sec for plan in plans), min(plan[0].event_id for plan in plans)))
+    for plans in groups:
+        plans.sort(key=lambda plan: plan[0].event_id)
+    for index in range(1, len(groups)):
+        previous, current = groups[index - 1], groups[index]
+        previous_selected_end = max(plan[0].end_sec for plan in previous)
+        current_selected_start = min(plan[0].start_sec for plan in current)
+        if previous_selected_end > current_selected_start + 1e-7:
             raise ValueError("高光事件仍有重叠，请先合并同一时间段的分镜")
-        lower = max(previous.end_sec, current_start)
-        upper = min(current.start_sec, previous_end)
-        boundary = max(lower, min((previous.end_sec + current.start_sec) / 2, upper))
-        plans[index - 1][2] = boundary
-        plans[index][1] = boundary
-    return [(event, start, end) for event, start, end in plans]
+        previous_clip_end = max(plan[2] for plan in previous)
+        current_clip_start = min(plan[1] for plan in current)
+        if previous_clip_end <= current_clip_start + 1e-9:
+            continue
+        lower = max(previous_selected_end, current_clip_start)
+        upper = min(current_selected_start, previous_clip_end)
+        boundary = max(lower, min((previous_selected_end + current_selected_start) / 2, upper))
+        for plan in previous:
+            plan[2] = min(plan[2], boundary)
+        for plan in current:
+            plan[1] = max(plan[1], boundary)
+    return [(event, start, end) for plans in groups for event, start, end in plans]
 
 
 def export_live_photos(cfg: ExportConfig, reader: VideoReader,
