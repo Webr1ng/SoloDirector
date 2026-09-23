@@ -43,7 +43,8 @@ _VISUAL_PROMPT = (
     _CRITERIA + "你是视觉评委，请独立观察时间戳图像序列；抽样间未看见的动作不能当作事实。"
     "先客观记录画面中人、物体、动作及变化，再独立选择精彩区间。"
     "facts只能包含可见的描述，不写精彩评价、推荐、分数或他人应该如何投票。"
-    "facts最多6条，每条仅start_sec,end_sec,description，0<=start_sec<end_sec<=duration，"
+    "facts优先写1到3条简短事实，最多6条；每条仅start_sec,end_sec,description，"
+    "时间必须是数字且0<=start_sec<end_sec<=duration，不要写原视频的绝对时间；"
     "description为非空中文且最多300字符；无人物或互动也可客观描述，不得编造。"
     + _OUTPUT + '返回结构示例：{"facts":[{"start_sec":0.0,"end_sec":1.0,'
     '"description":"可见内容的客观描述"}],"highlights":[]}。'
@@ -64,6 +65,21 @@ _RETRY_FORMAT = (
     "有高光必须有可见事实，无高光可以返回空数组；不得为满足格式编造高光。"
     "不要代码围栏、解释、评分或额外字段。"
 )
+_RETRY_HINTS = {
+    ("facts", "shape"): "上次facts不是0到6条的数组；请优先写1到3条简短事实。",
+    ("facts", "fields"): "上次facts内有条目字段不符；每条必须恰好包含start_sec、end_sec、description。",
+    ("facts", "time"): "上次facts时间无效；起止必须是数字，且0<=start_sec<end_sec<=duration。",
+    ("facts", "description"): "上次facts描述无效；每条description须为1到300字符的非空中文。",
+    ("highlights", None): "上次highlights格式或时间无效；每条仅填规定的五个字段，并逐项检查时间范围。",
+    ("top_level", None): "上次顶层字段不符；只能返回facts和highlights两个数组。",
+}
+
+
+def _retry_hint(error: dict) -> str:
+    validation = error.get("validation")
+    detail = error.get("detail")
+    return (_RETRY_HINTS.get((validation, detail))
+            or _RETRY_HINTS.get((validation, None)) or "")
 
 
 def _retryable(review: dict) -> bool:
@@ -172,6 +188,8 @@ class ExpertPanel:
             result["error"] = {"code": exc.code, "http_status": exc.status_code}
         except ReviewValidationError as exc:
             result["error"] = {"code": "invalid_review", "validation": exc.code}
+            if exc.detail is not None:
+                result["error"]["detail"] = exc.detail
         except ValueError:
             result["error"] = {"code": "review_failed"}
         except Exception:
@@ -256,7 +274,8 @@ class ExpertPanel:
                 attempt_counts[index] += 1
                 retry_content = content
                 if retry and reviews[index].get("error", {}).get("code") in {"invalid_review", "truncated"}:
-                    retry_content = [*content, {"type": "text", "text": _RETRY_FORMAT}]
+                    hint = _retry_hint(reviews[index].get("error", {}))
+                    retry_content = [*content, {"type": "text", "text": _RETRY_FORMAT + hint}]
                 reviews[index]["status"] = "running"
                 self._update_audit()
                 emit()

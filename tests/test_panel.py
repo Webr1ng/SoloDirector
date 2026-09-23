@@ -451,7 +451,8 @@ class PanelTests(unittest.TestCase):
             self.assertEqual([a["status"] for a in review["attempts"]], expected)
             if len(expected) == 2:
                 self.assertEqual(review["attempts"][0]["error"],
-                                 {"code": "invalid_review", "validation": "facts"})
+                                 {"code": "invalid_review", "validation": "facts",
+                                  "detail": "fields"})
                 self.assertEqual(sum(a["usage"]["total_tokens"] for a in review["attempts"]), 200)
             self.assertNotIn("error", review)
         retry_requests = [content for _, content in FakeClient.calls if "重新独立观察" in content[-1].get("text", "")]
@@ -459,6 +460,7 @@ class PanelTests(unittest.TestCase):
         first_images = [p for p in FakeClient.calls[0][1] if p["type"] == "image_url"]
         for content in retry_requests:
             self.assertEqual([p for p in content if p["type"] == "image_url"], first_images)
+            self.assertIn("每条必须恰好包含start_sec、end_sec、description", content[-1]["text"])
             self.assertNotIn("private-invalid-marker", json.dumps(content))
         self.assertNotIn("private-invalid-marker", json.dumps(report))
 

@@ -69,25 +69,35 @@ def _json(data: object) -> str:
         raise ValueError("评审必须可序列化为严格 JSON。") from None
 
 
+class _FactValidationError(ValueError):
+    def __init__(self, detail: str):
+        self.detail = detail
+        super().__init__("fact 字段不符合协议。")
+
+
 def _facts(items: object, duration: float) -> None:
     if not isinstance(items, list) or len(items) > MAX_FACTS:
-        raise ValueError("facts 必须为最多 6 条的数组。")
+        raise _FactValidationError("shape")
     for item in items:
         if not isinstance(item, dict) or set(item) != _FACT_FIELDS:
-            raise ValueError("fact 必须仅含 start_sec、end_sec、description。")
-        start = _number(item["start_sec"], "start_sec")
-        end = _number(item["end_sec"], "end_sec")
+            raise _FactValidationError("fields")
+        try:
+            start = _number(item["start_sec"], "start_sec")
+            end = _number(item["end_sec"], "end_sec")
+        except ValueError:
+            raise _FactValidationError("time") from None
         if not 0 <= start < end <= duration:
-            raise ValueError("fact 时间无效或越界。")
+            raise _FactValidationError("time")
         description = item["description"]
         if (not isinstance(description, str) or not description.strip()
                 or len(description) > MAX_DESCRIPTION_CHARS):
-            raise ValueError("description 必须为非空字符串且不超过 300 字符。")
+            raise _FactValidationError("description")
 
 
 class ReviewValidationError(ValueError):
-    def __init__(self, code: str):
+    def __init__(self, code: str, detail: str | None = None):
         self.code = code
+        self.detail = detail
         super().__init__("评委结果不符合协议：" + code)
 
 
@@ -102,8 +112,8 @@ def parse_visual_review(text: str, duration: float) -> dict:
         raise ReviewValidationError("top_level")
     try:
         _facts(data["facts"], duration)
-    except ValueError:
-        raise ReviewValidationError("facts") from None
+    except _FactValidationError as exc:
+        raise ReviewValidationError("facts", exc.detail) from None
     try:
         highlights = parse_highlights(_json({"highlights": data["highlights"]}), duration)
     except ValueError:

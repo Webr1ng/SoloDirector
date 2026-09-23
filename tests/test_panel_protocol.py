@@ -151,6 +151,17 @@ class ParseReviewTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, category)
             self.assertNotIn("private", str(caught.exception))
 
+    def test_fact_failure_detail_is_safe_and_specific(self):
+        cases = [([fact()] * 7, "shape"),
+                 ([fact(extra="private-marker")], "fields"),
+                 ([fact(end_sec=11)], "time"),
+                 ([fact(description="private-marker" * 100)], "description")]
+        for facts, detail in cases:
+            with self.subTest(detail=detail), self.assertRaises(panel_protocol.ReviewValidationError) as caught:
+                parse_visual_review(encode(visual(facts=facts)), 10)
+            self.assertEqual((caught.exception.code, caught.exception.detail), ("facts", detail))
+            self.assertNotIn("private-marker", str(caught.exception))
+
     def test_errors_do_not_echo_untrusted_text(self):
         with self.assertRaises(ValueError) as caught:
             parse_visual_review('private-marker: {invalid-json}', 10)
