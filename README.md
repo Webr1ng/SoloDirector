@@ -2,6 +2,10 @@
 
 > 影石 2026 BoldMaker 智能影像挑战赛「AI+影像产品开发赛道」作品
 
+<p align="center">
+  <img src="assets/boldmaker-poster.png" alt="SoloDirector 团队影石 2026 BoldMaker 智能影像挑战赛海报" width="720">
+</p>
+
 SoloDirector 是面向 Insta360 X5 和本地视频的 AI 高光剪辑工具。它在本机完成视频采集、人物检测、场景分区和视频导出；可选的视觉评委会分析候选片段，判断精彩动作从开始到结束的完整区间，再据此生成高光短片和合集。
 
 ## 功能
