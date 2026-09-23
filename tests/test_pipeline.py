@@ -7,11 +7,12 @@ from unittest.mock import patch
 import numpy as np
 
 from highlight360.config import Config, ExportConfig, PanelConfig, RegionConfig, TrackConfig
-from highlight360.export import clip_range, export_live_photos, render_candidate, render_candidates
+from highlight360.export import (clip_range, export_live_photos, render_candidate,
+                                 render_candidates, storyboard_clip_ranges)
 from highlight360.io_video import VideoReader, VideoWriter
 from highlight360.panel import _frames
 from highlight360.panel_protocol import parse_visual_review
-from highlight360.pipeline import deduplicate_events, run
+from highlight360.pipeline import assemble_storyboard, deduplicate_events, run
 from highlight360.tracker import IoUTracker
 from highlight360.types import BBox, CandidateRegion, HighlightEvent, ModelHighlight, ViewSpec
 
@@ -154,10 +155,11 @@ class PipelineTests(unittest.TestCase):
         with patch("highlight360.pipeline.Detector", FakeDetector), \
                 patch("highlight360.pipeline.ExpertPanel", FakeJudge):
             result = run(self.cfg)
-        self.assertEqual(result["events"], 2)
+        self.assertEqual(result["events"], 1)
         self.assertEqual(len(FakeJudge.calls), 2)
         self.assertTrue(all(not Path(path).exists() for path, _ in FakeJudge.calls))
         data = json.loads(Path(result["timeline"]).read_text(encoding="utf-8"))
+        self.assertEqual(data["events"][0]["source_candidate_ids"], [0, 1])
         for item in data["events"]:
             self.assertEqual(item["reason"], "人物展示动作")
             self.assertGreaterEqual(item["start_sec"], 0)
@@ -320,7 +322,7 @@ class PipelineTests(unittest.TestCase):
         with patch("highlight360.pipeline.Detector", FakeDetector), \
                 patch("highlight360.pipeline.ExpertPanel", FakeJudge):
             result = run(self.cfg)
-        self.assertEqual(result["events"], 2)
+        self.assertEqual(result["events"], 1)
         self.assertEqual(len(FakeJudge.calls), 2)
         self.assertFalse(list(Path(self.cfg.export.out_dir).glob("*.mp4")))
 
@@ -352,7 +354,7 @@ class PipelineTests(unittest.TestCase):
             result = run(self.cfg, progress=progress)
         stages = list(dict.fromkeys(u["stage"] for u in updates))
         self.assertEqual(stages, ["detect", "regions", "render", "judging", "export"])
-        for stage, total in (("detect", 20), ("render", 40), ("judging", 10), ("export", 60)):
+        for stage, total in (("detect", 20), ("render", 40), ("judging", 10), ("export", 30)):
             rows = [u for u in updates if u["stage"] == stage]
             self.assertEqual(rows[0]["done"], 0)
             self.assertEqual(rows[-1]["done"], total)
@@ -365,7 +367,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(judging[-1]["calls_done"], judging[-1]["calls_total"])
         self.assertTrue(all(e["status"] == "running" for e in judging[0]["experts"]))
         self.assertEqual(judging[1]["experts"][2]["status"], "ok")
-        self.assertEqual(len(source_reads), 4)
+        self.assertEqual(len(source_reads), 3)
         self.assertEqual(sum(r.get("end_sec") == 4 and r.get("start_sec") == 0 for r in source_reads), 1)
         self.assertTrue(all("max_width" not in r for r in source_reads[1:]))
         data = json.loads(Path(result["timeline"]).read_text(encoding="utf-8"))
@@ -404,7 +406,7 @@ class PipelineTests(unittest.TestCase):
                 patch("highlight360.panel.resolve_api_environment", return_value=("https://example.invalid/v1", "fake")), \
                 patch("requests.sessions.Session.request", side_effect=AssertionError("Network forbidden")):
             result = run(self.cfg, progress=updates.append)
-        self.assertEqual(result["events"], 2)
+        self.assertEqual(result["events"], 1)
         judging = [u for u in updates if u["stage"] == "judging"]
         self.assertEqual([u["done"] for u in judging], sorted(u["done"] for u in judging))
         self.assertTrue(all(u["done"] <= u["total"] for u in judging))
@@ -551,6 +553,15 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(encode.call_args.args[1].shape, (128, 128, 3))
         self.assertFalse((self.root / "highlight_reel.mp4").exists())
 
+    def test_fractional_selected_end_is_covered_by_last_exported_frame(self):
+        selected = event(start_sec=0.25, end_sec=3.31, best_sec=1.5)
+        self.cfg.export.out_dir = str(self.root)
+        with VideoReader(str(self.video), "flat") as reader:
+            export_live_photos(self.cfg.export, reader, [selected])
+        self.assertGreaterEqual(selected.clip_end_sec, selected.end_sec)
+        with VideoReader(str(self.root / "event0_live.mp4"), "flat") as clip:
+            self.assertEqual(clip.meta.frame_count, 31)
+
     def test_single_candidate_wrapper_writes_fractional_tail(self):
         candidate = CandidateRegion(12, .25, 2.3, ViewSpec("flat"), [0])
         path = self.root / "custom-name.mp4"
@@ -600,6 +611,53 @@ class TimelineTests(unittest.TestCase):
         self.assertLessEqual(start, selected.start_sec)
         self.assertGreaterEqual(end, selected.end_sec)
 
+    def test_padding_near_best_time_still_keeps_whole_action(self):
+        selected = event(start_sec=2.0, end_sec=4.0, best_sec=2.0)
+        self.assertEqual(clip_range(selected, 3, 5), (1.0, 4.0))
+
+    def test_short_adjacent_actions_trim_context_without_replaying_source_time(self):
+        first = event(start_sec=1.0, end_sec=2.0, best_sec=1.5)
+        second = event(event_id=1, candidate_id=1, start_sec=2.2,
+                       end_sec=3.2, best_sec=2.7)
+        plans = storyboard_clip_ranges([second, first], 3, 5)
+        self.assertEqual([item[0].event_id for item in plans], [0, 1])
+        self.assertEqual(plans[0][2], plans[1][1])
+        for chosen, start, end in plans:
+            self.assertLessEqual(start, chosen.start_sec)
+            self.assertGreaterEqual(end, chosen.end_sec)
+
+    def test_storyboard_merges_cross_view_replays_and_keeps_full_time_range(self):
+        views = [ViewSpec("equirectangular", yaw_deg=176, fov_deg=96),
+                 ViewSpec("equirectangular", yaw_deg=134, fov_deg=104),
+                 ViewSpec("equirectangular", yaw_deg=-167, fov_deg=124)]
+        events = [event(candidate_id=2, start_sec=6, end_sec=8, best_sec=7,
+                        view=views[0], consensus_support=0.6),
+                  event(candidate_id=3, start_sec=7, end_sec=8.5, best_sec=7.5,
+                        view=views[1], consensus_support=0.8),
+                  event(candidate_id=4, start_sec=8, end_sec=9, best_sec=8.5,
+                        view=views[2], consensus_support=0.6)]
+        storyboard = assemble_storyboard(events)
+        self.assertEqual(len(storyboard), 1)
+        chosen = storyboard[0]
+        self.assertEqual((chosen.start_sec, chosen.end_sec), (6, 9))
+        self.assertEqual(chosen.candidate_id, 3)
+        self.assertEqual(chosen.source_candidate_ids, [2, 3, 4])
+        self.assertLessEqual(chosen.view.fov_deg, 125)
+        for view in views:
+            gap = abs((chosen.view.yaw_deg - view.yaw_deg + 180) % 360 - 180)
+            self.assertLess(gap, chosen.view.fov_deg / 2)
+
+    def test_opposite_360_views_keep_only_stronger_complete_action(self):
+        first = event(view=ViewSpec("equirectangular", yaw_deg=0),
+                      consensus_support=0.8)
+        second = event(candidate_id=1, view=ViewSpec("equirectangular", yaw_deg=180),
+                       consensus_support=0.6)
+        storyboard = assemble_storyboard([second, first])
+        self.assertEqual(len(storyboard), 1)
+        self.assertEqual((storyboard[0].start_sec, storyboard[0].end_sec), (1, 2))
+        self.assertEqual(storyboard[0].view.yaw_deg, 0)
+        self.assertEqual(storyboard[0].source_candidate_ids, [0])
+
     def test_padding_respects_both_source_edges_and_short_source(self):
         near_end = event(start_sec=3.5, end_sec=3.8, best_sec=3.7)
         self.assertEqual(clip_range(near_end, 3, 4), (1, 4))
@@ -617,6 +675,15 @@ class TimelineTests(unittest.TestCase):
     def test_overlapping_window_duplicate_removed(self):
         events = [event(), event(candidate_id=1, start_sec=1.1, end_sec=2.1, best_sec=1.6)]
         self.assertEqual(len(deduplicate_events(events)), 1)
+
+    def test_same_view_duplicate_keeps_stronger_jury_consensus(self):
+        weak = event(consensus_support=0.6)
+        strong = event(candidate_id=1, start_sec=1.1, end_sec=2.1,
+                       best_sec=1.6, consensus_support=0.8)
+        selected = deduplicate_events([weak, strong])
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].candidate_id, 1)
+        self.assertEqual(selected[0].event_id, 0)
 
     def test_shared_bystander_does_not_merge_different_compositions(self):
         views = [

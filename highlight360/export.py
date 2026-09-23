@@ -111,19 +111,45 @@ def clip_range(event: HighlightEvent, min_sec: float, source_duration: float) ->
     duration = min(min_sec, source_duration)
     if end - start < duration - 1e-7:
         center = max(start, min(end, event.best_sec))
-        start = max(0.0, min(center - duration / 2, source_duration - duration))
+        # 可移动的补足窗口必须同时包住模型选中的完整动作区间。
+        earliest = max(0.0, end - duration)
+        latest = min(start, source_duration - duration)
+        start = max(earliest, min(center - duration / 2, latest))
         end = start + duration
     return start, end
+
+
+def storyboard_clip_ranges(events: list[HighlightEvent], min_sec: float,
+                           source_duration: float) -> list[tuple[HighlightEvent, float, float]]:
+    """相邻动作可缩短补充背景，但不截掉模型选出的区间，也不回放源时间。"""
+    plans = [[event, *clip_range(event, min_sec, source_duration)]
+             for event in sorted(events, key=lambda item: (item.start_sec, item.event_id))]
+    for index in range(1, len(plans)):
+        previous, _, previous_end = plans[index - 1]
+        current, current_start, _ = plans[index]
+        if previous_end <= current_start + 1e-9:
+            continue
+        if previous.end_sec > current.start_sec + 1e-7:
+            raise ValueError("高光事件仍有重叠，请先合并同一时间段的分镜")
+        lower = max(previous.end_sec, current_start)
+        upper = min(current.start_sec, previous_end)
+        boundary = max(lower, min((previous.end_sec + current.start_sec) / 2, upper))
+        plans[index - 1][2] = boundary
+        plans[index][1] = boundary
+    return [(event, start, end) for event, start, end in plans]
 
 
 def export_live_photos(cfg: ExportConfig, reader: VideoReader,
                        events: list[HighlightEvent], progress: Callable[[dict], None] | None = None) -> None:
     plans = []
     if cfg.export_video:
-        for event in events:
-            start, end = clip_range(event, cfg.live_photo_sec, reader.meta.duration_sec)
-            count = int(math.floor((end - start) * cfg.fps + 1e-7))
-            plans.append((event, start, start + count / cfg.fps, count))
+        for event, start, end in storyboard_clip_ranges(
+                events, cfg.live_photo_sec, reader.meta.duration_sec):
+            # 最后一张画面也须覆盖模型选中的动作终点；浮点误差不能多算一帧。
+            count = int(math.ceil((end - start) * cfg.fps - 1e-7))
+            if count <= 0:
+                raise ValueError("高光分镜短于一帧，无法导出视频")
+            plans.append((event, start, end, count))
     # total 只统计各事件短片帧数；合集(reel)与事件帧同源同帧写出，不重复计数，
     # 否则 done<=total 的进度合同会被破坏。
     total = sum(count for _, _, _, count in plans)

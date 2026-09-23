@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import math
 from pathlib import Path
@@ -44,11 +44,16 @@ def _views_close(a: ViewSpec, b: ViewSpec) -> bool:
     return math.degrees(math.acos(max(-1.0, min(1.0, cosine)))) <= 5 + 1e-9
 
 
+def _event_priority(event: HighlightEvent) -> tuple[float, float, int, float, int]:
+    return (event.consensus_support, event.end_sec - event.start_sec,
+            len(event.involved_track_ids), event.view.fov_deg, -event.candidate_id)
+
+
 def deduplicate_events(events: list[HighlightEvent]) -> list[HighlightEvent]:
     kept = []
     for event in sorted(events, key=lambda e: (e.start_sec, e.candidate_id)):
-        duplicate = False
-        for previous in kept:
+        duplicate_index = None
+        for index, previous in enumerate(kept):
             if not _views_close(event.view, previous.view):
                 continue
             if not set(event.involved_track_ids).intersection(previous.involved_track_ids):
@@ -56,12 +61,81 @@ def deduplicate_events(events: list[HighlightEvent]) -> list[HighlightEvent]:
             intersection = min(event.end_sec, previous.end_sec) - max(event.start_sec, previous.start_sec)
             shorter = min(event.end_sec - event.start_sec, previous.end_sec - previous.start_sec)
             if intersection / shorter >= 0.7 and abs(event.best_sec - previous.best_sec) <= 0.75:
-                duplicate = True
+                duplicate_index = index
                 break
-        if not duplicate:
-            event.event_id = len(kept)
+        if duplicate_index is None:
             kept.append(event)
+        elif _event_priority(event) > _event_priority(kept[duplicate_index]):
+            kept[duplicate_index] = event
+    kept.sort(key=lambda event: (event.start_sec, event.candidate_id))
+    for index, event in enumerate(kept):
+        event.event_id = index
     return kept
+
+
+def _storyboard_view(group: list[HighlightEvent]) -> ViewSpec | None:
+    """同一时刻只取一个镜头；相近全景方向扩大构图以覆盖各候选中心。"""
+    views = [event.view for event in group]
+    if len(views) == 1:
+        return views[0]
+    if all(view.projection == "flat" for view in views):
+        boxes = [view.flat_box for view in views]
+        if any(len(box) != 4 or not all(map(math.isfinite, box)) for box in boxes):
+            return None
+        return ViewSpec("flat", flat_box=(min(box[0] for box in boxes),
+                                          min(box[1] for box in boxes),
+                                          max(box[2] for box in boxes),
+                                          max(box[3] for box in boxes)))
+    if not all(view.projection == "equirectangular" and all(map(
+            math.isfinite, (view.yaw_deg, view.pitch_deg, view.fov_deg))) for view in views):
+        return None
+    angles = sorted(view.yaw_deg % 360 for view in views)
+    gaps = [right - left for left, right in zip(angles, angles[1:])]
+    gaps.append(angles[0] + 360 - angles[-1])
+    gap_index = max(range(len(gaps)), key=gaps.__getitem__)
+    arc = 360 - gaps[gap_index]
+    pitches = [view.pitch_deg for view in views]
+    if arc > 80 or max(pitches) - min(pitches) > 30:
+        return None  # 相反方向无法用一个方形镜头完整呈现，保留最有共识的一段。
+    center = (angles[(gap_index + 1) % len(angles)] + arc / 2 + 180) % 360 - 180
+    fov = min(125.0, max(max(view.fov_deg for view in views), arc + 60,
+                         max(pitches) - min(pitches) + 60))
+    return ViewSpec("equirectangular", yaw_deg=center,
+                    pitch_deg=(min(pitches) + max(pitches)) / 2, fov_deg=fov)
+
+
+def assemble_storyboard(events: list[HighlightEvent]) -> list[HighlightEvent]:
+    """同一源时间只播一次；重合动作合并时间轴并从全景中选一个覆盖视角。"""
+    ordered = sorted(events, key=lambda event: (event.start_sec, event.end_sec, event.candidate_id))
+    if any(not all(map(math.isfinite, (event.start_sec, event.end_sec, event.best_sec)))
+           or event.end_sec <= event.start_sec for event in ordered):
+        raise ValueError("高光时间轴包含无效区间")
+    groups: list[list[HighlightEvent]] = []
+    for event in ordered:
+        if groups and event.start_sec < max(item.end_sec for item in groups[-1]) - 1e-7:
+            groups[-1].append(event)
+        else:
+            groups.append([event])
+    storyboard = []
+    for group in groups:
+        best = max(group, key=_event_priority)
+        view = _storyboard_view(group)
+        if view is None:
+            merged = replace(best)
+            sources = [best]
+        else:
+            merged = replace(best, start_sec=min(item.start_sec for item in group),
+                             end_sec=max(item.end_sec for item in group), view=view,
+                             candidate_start_sec=min(item.candidate_start_sec for item in group),
+                             candidate_end_sec=max(item.candidate_end_sec for item in group),
+                             involved_track_ids=sorted({track for item in group
+                                                        for track in item.involved_track_ids}),
+                             person_ids=sorted({person for item in group for person in item.person_ids}))
+            sources = group
+        merged.event_id = len(storyboard)
+        merged.source_candidate_ids = sorted({item.candidate_id for item in sources})
+        storyboard.append(merged)
+    return storyboard
 
 
 def _validate_output_directory(root: Path, input_path: str) -> None:
@@ -221,9 +295,12 @@ def run(cfg: Config, progress: Callable[[dict], None] | None = None) -> dict:
                                                                   allow_nan=False), encoding="utf-8")
                             calls_done += local_done
                             failed_done += local_failed
-                            for selection in selections:
+                            consensus = judge.last_report.get("consensus", [])
+                            for selection_index, selection in enumerate(selections):
                                 people_ids = sorted({track_people[tid] for tid in candidate.track_ids
                                                      if track_people.get(tid) is not None})
+                                agreement = (consensus[selection_index]
+                                             if selection_index < len(consensus) else {})
                                 events.append(HighlightEvent(
                                     event_id=len(events), candidate_id=candidate.candidate_id,
                                     start_sec=candidate.start_sec + selection.start_sec,
@@ -233,6 +310,7 @@ def run(cfg: Config, progress: Callable[[dict], None] | None = None) -> dict:
                                     involved_track_ids=candidate.track_ids.copy(), person_ids=people_ids,
                                     candidate_start_sec=candidate.start_sec, candidate_end_sec=candidate.end_sec,
                                     jury_report_path=report_path.relative_to(root).as_posix(),
+                                    consensus_support=agreement.get("conservative_min_support", 0.0),
                                 ))
                         candidate_done += 1
                         print(f"已处理候选 {candidate_done}/{len(candidates)}", flush=True)
@@ -243,7 +321,7 @@ def run(cfg: Config, progress: Callable[[dict], None] | None = None) -> dict:
         if not candidates or cfg.prepare_only:
             emit("judging", 0, 0, "calls", experts=[], failed=0, candidate_done=candidate_done,
                  candidate_total=len(candidates), calls_done=0, calls_total=0)
-        events = deduplicate_events(events)
+        events = assemble_storyboard(deduplicate_events(events))
         export_live_photos(cfg.export, reader, events, progress=progress)
         source = {**asdict(meta), "path": str(Path(cfg.input_path).resolve()),
                   "analysis_width": analysis_width, "analysis_height": analysis_height,

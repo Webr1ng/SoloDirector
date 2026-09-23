@@ -120,3 +120,5 @@ class HighlightEvent:
     candidate_start_sec: float = 0.0
     candidate_end_sec: float = 0.0
     jury_report_path: str = ""
+    consensus_support: float = 0.0
+    source_candidate_ids: list[int] = field(default_factory=list)
